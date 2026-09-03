@@ -1,2 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv
-venv
+venv/
+
+# Environment / secrets
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+certs/
+
+# Database
+data/*
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+
+# Chroma / vector store
+chroma_db/
+
+# Logs
+*.log
+logs/
+
+# Local ingestion artifacts
+backend/rag/data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store.env
+__pycache__/
+*.pyc
+.env
+.env.example
+__pycache__/
+*.pyc
