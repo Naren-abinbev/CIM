@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from backend.core.config import Settings, get_settings
@@ -59,6 +59,18 @@ class IncidentSearchResponse(BaseModel):
     vector_store: str
     total_results: int
     results: list[SearchResult]
+
+
+class ChromaRecord(BaseModel):
+    id: str
+    document: str | None = None
+    metadata: dict[str, Any] = {}
+
+
+class ChromaRecordsResponse(BaseModel):
+    collection: str
+    total_records: int
+    records: list[ChromaRecord]
 
 
 def _meaningful_metadata(metadata: IncidentMetadata | None) -> dict[str, str]:
@@ -173,6 +185,50 @@ def _get_chroma_collection(settings: Settings) -> Any:
     )
 
 
+@router.get("/records", response_model=ChromaRecordsResponse)
+async def fetch_chroma_records(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> ChromaRecordsResponse:
+    """Fetch stored records from the configured local ChromaDB collection."""
+    settings = get_settings()
+    try:
+        collection = await asyncio.to_thread(_get_chroma_collection, settings)
+        payload = await asyncio.to_thread(
+            lambda: collection.get(
+                limit=limit,
+                include=["documents", "metadatas"],
+            )
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch records from ChromaDB.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": {
+                    "code": "CHROMA_FETCH_FAILED",
+                    "message": "Unable to fetch records from ChromaDB.",
+                }
+            },
+        ) from exc
+
+    ids = payload.get("ids", []) or []
+    documents = payload.get("documents", []) or []
+    metadatas = payload.get("metadatas", []) or []
+    records = [
+        ChromaRecord(
+            id=str(record_id),
+            document=documents[index] if index < len(documents) else None,
+            metadata=metadatas[index] or {} if index < len(metadatas) else {},
+        )
+        for index, record_id in enumerate(ids)
+    ]
+    return ChromaRecordsResponse(
+        collection=settings.chroma_collection_name,
+        total_records=len(records),
+        records=records,
+    )
+
+
 def _keyword_score(query_text: str, content: str) -> float:
     query_terms = set(re.findall(r"[a-z0-9]+", query_text.lower()))
     content_terms = set(re.findall(r"[a-z0-9]+", content.lower()))
@@ -214,17 +270,13 @@ async def _chroma_search(settings: Settings, search_text: str, embedding: list[f
     ids = payload.get("ids", [[]])[0] or []
     metadatas = payload.get("metadatas", [[]])[0] or []
     distances = payload.get("distances", [[]])[0] or []
-    results = [
-        result
-        for result in _rerank_chroma_results(
-            search_text,
-            documents,
-            ids,
-            metadatas,
-            distances,
-        )
-        if result.score > settings.search_min_relevance_score
-    ][:TOP_K]
+    results = _rerank_chroma_results(
+        search_text,
+        documents,
+        ids,
+        metadatas,
+        distances,
+    )[:TOP_K]
     logger.info("Retrieved %s ChromaDB candidates after keyword reranking.", len(results))
     return results
 
@@ -233,11 +285,24 @@ async def _search(request: IncidentSearchRequest) -> IncidentSearchResponse:
     settings = get_settings()
     search_text = _build_search_text(request)
     metadata = _meaningful_metadata(request.metadata)
+    if not search_text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": {
+                    "code": "INVALID_INCIDENT_TEXT",
+                    "message": "Provide short_description or description for the search.",
+                }
+            },
+        )
     logger.info("Incident search request received. Generating Gemini embedding.")
     try:
         embedding = await GeminiEmbeddingClient(settings).generate_embedding(search_text)
     except GeminiEmbeddingError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail={"error": {"code": "EMBEDDING_FAILED", "message": str(exc)}}) from exc
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": {"code": "EMBEDDING_FAILED", "message": str(exc)}},
+        ) from exc
 
     if _azure_configured(settings):
         logger.info("Using Azure AI Search.")

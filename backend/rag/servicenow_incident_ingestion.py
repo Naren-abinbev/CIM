@@ -382,6 +382,8 @@ class GeminiEmbeddingClient:
             )
             return normalized
 
+        except GeminiEmbeddingError:
+            raise
         except Exception as exc:  # pragma: no cover - API library behavior varies
             logger.exception("Gemini embedding generation failed.")
             raise GeminiEmbeddingError(
