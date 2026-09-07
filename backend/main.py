@@ -40,6 +40,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"status": "running", "docs": "/docs", "health": "/health"}
+
 # CORS: allow only the configured frontend origin.
 # Never use allow_origins=["*"] with credentials in production.
 app.add_middleware(
