@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Generator
 from pathlib import Path
 
@@ -44,7 +45,7 @@ def _ensure_sqlite_parent(database_url: str) -> None:
 
 
 def _configure_sqlite(
-    dbapi_connection: object,
+    dbapi_connection: sqlite3.Connection,
     _connection_record: object,
 ) -> None:
     """
