@@ -4,12 +4,18 @@ import asyncio
 import logging
 import re
 from collections.abc import Iterable
+from typing import Annotated
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_validator
+from sqlalchemy.orm import Session
 
+from backend.api.dependencies import CurrentUser
 from backend.core.config import Settings, get_settings
+from backend.database.database import get_db
+from backend.services import incident_service
+from backend.schemas.incident import IncidentCreate, IncidentResponse
 from backend.rag.servicenow_incident_ingestion import (
     GeminiEmbeddingClient,
     GeminiEmbeddingError,
@@ -23,6 +29,69 @@ TOP_K = 3
 VECTOR_WEIGHT = 0.7
 KEYWORD_WEIGHT = 0.3
 FILTER_FIELDS = {"incnumber", "link", "created", "closed", "severity", "priority", "correlation_id"}
+
+
+@router.post(
+    "",
+    response_model=IncidentResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Incidents"],
+)
+def create_incident(
+    payload: IncidentCreate,
+    db: Annotated[Session, Depends(get_db)],
+    user: CurrentUser,
+) -> IncidentResponse:
+    """Create an incident in SQLite for the authenticated user."""
+    try:
+        incident = incident_service.create_incident(
+            db,
+            payload=payload,
+            user_email=user.email,
+        )
+        db.commit()
+        db.refresh(incident)
+        return IncidentResponse.model_validate(incident)
+    except incident_service.IncidentAlreadyExistsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": {
+                    "code": "INCIDENT_ALREADY_EXISTS",
+                    "message": str(exc),
+                }
+            },
+        ) from exc
+
+
+@router.get(
+    "/by-number/{incident_number}",
+    response_model=IncidentResponse,
+    tags=["Incidents"],
+)
+def get_incident_by_number(
+    incident_number: str,
+    db: Annotated[Session, Depends(get_db)],
+    _user: CurrentUser,
+) -> IncidentResponse:
+    """Read an incident by its incident number."""
+    try:
+        incident = incident_service.get_incident_by_number(
+            db,
+            incident_number=incident_number,
+        )
+        return IncidentResponse.model_validate(incident)
+    except incident_service.IncidentNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "INCIDENT_NOT_FOUND",
+                    "message": str(exc),
+                }
+            },
+        ) from exc
 
 
 class IncidentMetadata(BaseModel):
