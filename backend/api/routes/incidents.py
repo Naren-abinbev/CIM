@@ -48,6 +48,7 @@ def create_incident(
             db,
             payload=payload,
             user_email=user.email,
+            user_id=user.id,
         )
         db.commit()
         db.refresh(incident)

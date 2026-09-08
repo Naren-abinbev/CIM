@@ -11,30 +11,22 @@ without creating duplicate sample rows.
 from __future__ import annotations
 
 import sys
-from decimal import Decimal
 from pathlib import Path
-
-from sqlalchemy import select
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.auth import security
-from backend.auth import service as auth_service
+from backend.core.agent_registry import get_agent_id
 from backend.database.database import SessionLocal
-from backend.database.models import RefreshToken
+from backend.schemas.agent_execution import AgentExecutionRecord
 from backend.database.repositories import (
-    AgentExecutionRepository,
-    BlastRadiusRepository,
+    AgentExecutionLogRepository,
     CommanderRepository,
-    DuplicateIdentificationRepository,
-    IncidentAnalysisRepository,
     IncidentCommanderRepository,
     IncidentPerformanceMetricRepository,
     IncidentRepository,
-    ModelFallbackRepository,
-    ResolutionIntelligenceRepository,
     StakeholderReportRepository,
     UserRepository,
     WarRoomRepository,
@@ -66,8 +58,10 @@ def _get_or_create_sample_user(db):
 def _get_or_create_sample_incident(
     db,
     *,
+    user_id: str,
     incident_number: str,
     subject: str,
+    category: str,
     short_description: str,
 ):
     incident = IncidentRepository.get_by_number(db, incident_number)
@@ -78,7 +72,9 @@ def _get_or_create_sample_incident(
         db,
         incident_number=incident_number,
         user_email=SAMPLE_USER_EMAIL,
+        user_id=user_id,
         subject=subject,
+        category=category,
         short_description=short_description,
         description=(
             "Development sample data for testing the incident-management "
@@ -90,29 +86,6 @@ def _get_or_create_sample_incident(
     )
 
 
-def _seed_refresh_token(db, user_id: str) -> None:
-    """Create one sample refresh-token row without printing the token."""
-    existing = db.execute(
-        select(RefreshToken).where(RefreshToken.user_id == user_id)
-    ).scalars().first()
-
-    if existing is not None:
-        return
-
-    user = UserRepository.get_by_id(db, user_id)
-    if user is None:
-        raise RuntimeError("Sample user was not found while seeding tokens.")
-
-    # issue_token_pair creates the server-side refresh-token row. The raw
-    # token is intentionally not printed or stored by this seed script.
-    auth_service.issue_token_pair(
-        db,
-        user=user,
-        user_agent="seed-data",
-        ip_address="127.0.0.1",
-    )
-
-
 def seed_sample_data() -> None:
     db = SessionLocal()
 
@@ -121,21 +94,25 @@ def seed_sample_data() -> None:
 
         commander = CommanderRepository.get_or_create(
             db,
-            name="Sample Commander",
             email=SAMPLE_COMMANDER_EMAIL,
+            original_user_id=user.id,
         )
 
         incident = _get_or_create_sample_incident(
             db,
+            user_id=user.id,
             incident_number=SAMPLE_INCIDENT_NUMBER,
             subject="Sample database outage",
+            category="infrastructure",
             short_description="Sample database connectivity incident",
         )
 
         matched_incident = _get_or_create_sample_incident(
             db,
+            user_id=user.id,
             incident_number=SAMPLE_MATCHED_INCIDENT_NUMBER,
             subject="Sample related database incident",
+            category="infrastructure",
             short_description="Sample related database timeout incident",
         )
 
@@ -148,59 +125,8 @@ def seed_sample_data() -> None:
                 db,
                 incident_id=incident.incident_id,
                 commander_id=commander.commander_id,
+                assignment_id="sample-assignment-001",
                 is_primary=True,
-            )
-
-        if IncidentAnalysisRepository.get_first_for_incident(
-            db,
-            incident.incident_id,
-        ) is None:
-            IncidentAnalysisRepository.create(
-                db,
-                incident_id=incident.incident_id,
-                intent="service outage",
-                severity_prediction="high",
-            )
-
-        if DuplicateIdentificationRepository.get_first_for_incident(
-            db,
-            incident.incident_id,
-        ) is None:
-            DuplicateIdentificationRepository.create(
-                db,
-                incident_id=incident.incident_id,
-                matched_incident_id=matched_incident.incident_id,
-                similarity_score=Decimal("0.9200"),
-                decision="duplicate",
-                detection_method="vector_search",
-            )
-
-        if BlastRadiusRepository.get_first_for_incident(
-            db,
-            incident.incident_id,
-        ) is None:
-            BlastRadiusRepository.create(
-                db,
-                incident_id=incident.incident_id,
-                affected_service="Sample Payment Service",
-                affected_component="Sample Payment API",
-                dependency_type="downstream",
-                impact_level="high",
-                correlation_score=Decimal("0.8800"),
-                confidence_score=Decimal("0.9100"),
-                evidence="Sample timeout events correlate with payment failures.",
-            )
-
-        if ResolutionIntelligenceRepository.get_first_for_incident(
-            db,
-            incident.incident_id,
-        ) is None:
-            ResolutionIntelligenceRepository.create(
-                db,
-                incident_id=incident.incident_id,
-                resolver_team="Sample Platform Team",
-                recommended_resolution="Restart the sample payment dependency.",
-                resolution_source="seed",
             )
 
         war_room = WarRoomRepository.get_first_for_incident(
@@ -224,29 +150,39 @@ def seed_sample_data() -> None:
                 incident_id=incident.incident_id,
             )
 
-        execution = AgentExecutionRepository.get_first_for_incident(
+        sample_agent_id = get_agent_id("sample-investigation-agent")
+        execution = AgentExecutionLogRepository.get_for_incident_and_agent(
             db,
             incident.incident_id,
+            sample_agent_id,
         )
         if execution is None:
-            execution = AgentExecutionRepository.create(
+            execution = AgentExecutionLogRepository.create(
                 db,
                 incident_id=incident.incident_id,
-                agent_name="sample-investigation-agent",
-                model_name="sample-model",
-                model_type="chat",
+                agent_id=sample_agent_id,
             )
 
-        if ModelFallbackRepository.get_first_for_execution(
-            db,
-            execution.execution_id,
-        ) is None:
-            ModelFallbackRepository.create(
+        if not execution.execution_history:
+            AgentExecutionLogRepository.append_execution_record(
                 db,
-                execution_id=execution.execution_id,
-                model_name="sample-model",
-                fallback_level="primary",
-                success=True,
+                record=execution,
+                execution_record=AgentExecutionRecord(
+                    attempt=1,
+                    model_name="sample-model",
+                    model_type="chat",
+                    fallback_level="primary",
+                    fallback_used=False,
+                    success=True,
+                    execution_status="completed",
+                    input_tokens=120,
+                    output_tokens=80,
+                    total_tokens=200,
+                    latency_ms=450,
+                    confidence_score=0.91,
+                    evaluation_score=0.88,
+                    judge_score=0.90,
+                ),
             )
 
         if StakeholderReportRepository.get_first_for_incident(
@@ -269,12 +205,10 @@ def seed_sample_data() -> None:
         db.commit()
 
         # The existing auth service commits its token record internally.
-        _seed_refresh_token(db, user.id)
-
         print("Sample data is ready.")
         print(f"Incident: {incident.incident_number} ({incident.incident_id})")
         print(f"Matched incident: {matched_incident.incident_number}")
-        print(f"Commander: {commander.name} ({commander.commander_id})")
+        print(f"Commander: {commander.email} ({commander.commander_id})")
 
     except Exception:
         db.rollback()

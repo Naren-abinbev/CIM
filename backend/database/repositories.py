@@ -1,23 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from backend.schemas.agent_execution import AgentExecutionRecord
+from backend.schemas.incident_analysis import IncidentAnalysisRecord
 from backend.database.models import (
-    AgentExecution,
-    BlastRadius,
+    AgentExecutionLog,
     Commander,
-    DuplicateIdentification,
-    IncidentAnalysis,
     IncidentCommander,
     IncidentMaster,
     IncidentPerformanceMetric,
-    ModelFallback,
-    RefreshToken,
-    ResolutionIntelligence,
     StakeholderReport,
     User,
     WarRoom,
@@ -78,77 +72,6 @@ class UserRepository:
         db.commit()
 
 
-class RefreshTokenRepository:
-    """Persistence operations for RefreshToken records."""
-
-    @staticmethod
-    def get_by_hash(db: Session, token_hash: str) -> RefreshToken | None:
-        stmt = select(RefreshToken).where(
-            RefreshToken.token_hash == token_hash
-        )
-        return db.execute(stmt).scalar_one_or_none()
-
-    @staticmethod
-    def create(
-        db: Session,
-        *,
-        user_id: str,
-        token_hash: str,
-        token_family: str,
-        expires_at: datetime,
-        user_agent: str | None = None,
-        ip_address: str | None = None,
-    ) -> RefreshToken:
-        record = RefreshToken(
-            user_id=user_id,
-            token_hash=token_hash,
-            token_family=token_family,
-            expires_at=expires_at,
-            user_agent=user_agent,
-            ip_address=ip_address,
-        )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record
-
-    @staticmethod
-    def revoke(
-        db: Session,
-        record: RefreshToken,
-        *,
-        replaced_by_token_id: str | None = None,
-    ) -> None:
-        record.revoked_at = _utcnow()
-        record.replaced_by_token_id = replaced_by_token_id
-        db.commit()
-
-    @staticmethod
-    def revoke_family(db: Session, token_family: str) -> None:
-        """
-        Revoke every token in a family.
-
-        Used when refresh-token reuse is detected.
-        """
-        stmt = select(RefreshToken).where(
-            RefreshToken.token_family == token_family,
-            RefreshToken.revoked_at.is_(None),
-        )
-        records = db.execute(stmt).scalars().all()
-
-        now = _utcnow()
-
-        for record in records:
-            record.revoked_at = now
-
-        db.commit()
-
-    @staticmethod
-    def touch_last_used(db: Session, record: RefreshToken) -> None:
-        record.last_used_at = _utcnow()
-        db.commit()
-
-
 class CommanderRepository:
     """Persistence operations for Commander records."""
 
@@ -165,14 +88,20 @@ class CommanderRepository:
     def get_or_create(
         db: Session,
         *,
-        name: str,
         email: str,
+        original_user_id: str | None = None,
     ) -> Commander:
         commander = CommanderRepository.get_by_email(db, email)
         if commander is not None:
+            if original_user_id is not None and commander.original_user_id is None:
+                commander.original_user_id = original_user_id
+            db.flush()
             return commander
 
-        commander = Commander(name=name, email=email)
+        commander = Commander(
+            email=email,
+            original_user_id=original_user_id,
+        )
         db.add(commander)
         db.flush()
         return commander
@@ -207,11 +136,15 @@ class IncidentRepository:
         zone: str,
         service_name: str,
         source: str,
+        category: str = "uncategorized",
+        user_id: str | None = None,
     ) -> IncidentMaster:
         incident = IncidentMaster(
             incident_number=incident_number,
+            user_id=user_id,
             user_email=user_email,
             subject=subject,
+            category=category,
             short_description=short_description,
             description=description,
             zone=zone,
@@ -219,6 +152,41 @@ class IncidentRepository:
             source=source,
         )
         db.add(incident)
+        db.flush()
+        return incident
+
+    @staticmethod
+    def append_analysis_record(
+        db: Session,
+        *,
+        incident: IncidentMaster,
+        analysis_record: IncidentAnalysisRecord,
+    ) -> IncidentMaster:
+        """Append an analysis result without replacing prior analysis history."""
+        history = list(incident.analysis_history or [])
+        history.append(analysis_record.model_dump(mode="json", exclude_none=True))
+        incident.analysis_history = history
+        incident.analysis_created_at = analysis_record.analyzed_at or _utcnow()
+
+        # Keep the dedicated columns as a convenient projection of the latest
+        # analysis while retaining every result in analysis_history.
+        latest = analysis_record.model_dump(exclude_none=True)
+        for field in (
+            "intent",
+            "intent_confidence",
+            "severity_prediction",
+            "severity_confidence",
+            "business_impact",
+            "risk_score",
+            "next_best_action",
+            "root_cause_hypothesis",
+            "confidence_score",
+            "author_input_score",
+            "resolution_evaluation_score",
+            "recommendation_status",
+        ):
+            if field in latest:
+                setattr(incident, field, latest[field])
         db.flush()
         return incident
 
@@ -246,156 +214,18 @@ class IncidentCommanderRepository:
         *,
         incident_id: str,
         commander_id: str,
+        assignment_id: str | None = None,
         is_primary: bool = False,
     ) -> IncidentCommander:
         assignment = IncidentCommander(
             incident_id=incident_id,
             commander_id=commander_id,
+            assignment_id=assignment_id,
             is_primary=is_primary,
         )
         db.add(assignment)
         db.flush()
         return assignment
-
-
-class IncidentAnalysisRepository:
-    """Persistence operations for IncidentAnalysis records."""
-
-    @staticmethod
-    def get_first_for_incident(
-        db: Session,
-        incident_id: str,
-    ) -> IncidentAnalysis | None:
-        stmt = select(IncidentAnalysis).where(
-            IncidentAnalysis.incident_id == incident_id
-        )
-        return db.execute(stmt).scalars().first()
-
-    @staticmethod
-    def create(
-        db: Session,
-        *,
-        incident_id: str,
-        intent: str,
-        severity_prediction: str,
-    ) -> IncidentAnalysis:
-        analysis = IncidentAnalysis(
-            incident_id=incident_id,
-            intent=intent,
-            severity_prediction=severity_prediction,
-            recommendation_status="pending",
-        )
-        db.add(analysis)
-        db.flush()
-        return analysis
-
-
-class DuplicateIdentificationRepository:
-    """Persistence operations for duplicate-identification records."""
-
-    @staticmethod
-    def get_first_for_incident(
-        db: Session,
-        incident_id: str,
-    ) -> DuplicateIdentification | None:
-        stmt = select(DuplicateIdentification).where(
-            DuplicateIdentification.incident_id == incident_id
-        )
-        return db.execute(stmt).scalars().first()
-
-    @staticmethod
-    def create(
-        db: Session,
-        *,
-        incident_id: str,
-        matched_incident_id: str,
-        similarity_score: Decimal,
-        decision: str,
-        detection_method: str,
-    ) -> DuplicateIdentification:
-        duplicate = DuplicateIdentification(
-            incident_id=incident_id,
-            matched_incident_id=matched_incident_id,
-            similarity_score=similarity_score,
-            decision=decision,
-            detection_method=detection_method,
-        )
-        db.add(duplicate)
-        db.flush()
-        return duplicate
-
-
-class BlastRadiusRepository:
-    """Persistence operations for BlastRadius records."""
-
-    @staticmethod
-    def get_first_for_incident(
-        db: Session,
-        incident_id: str,
-    ) -> BlastRadius | None:
-        stmt = select(BlastRadius).where(BlastRadius.incident_id == incident_id)
-        return db.execute(stmt).scalars().first()
-
-    @staticmethod
-    def create(
-        db: Session,
-        *,
-        incident_id: str,
-        affected_service: str,
-        affected_component: str,
-        dependency_type: str,
-        impact_level: str,
-        correlation_score: Decimal,
-        confidence_score: Decimal,
-        evidence: str,
-    ) -> BlastRadius:
-        record = BlastRadius(
-            incident_id=incident_id,
-            affected_service=affected_service,
-            affected_component=affected_component,
-            dependency_type=dependency_type,
-            impact_level=impact_level,
-            correlation_score=correlation_score,
-            confidence_score=confidence_score,
-            evidence=evidence,
-        )
-        db.add(record)
-        db.flush()
-        return record
-
-
-class ResolutionIntelligenceRepository:
-    """Persistence operations for resolution records."""
-
-    @staticmethod
-    def get_first_for_incident(
-        db: Session,
-        incident_id: str,
-    ) -> ResolutionIntelligence | None:
-        stmt = select(ResolutionIntelligence).where(
-            ResolutionIntelligence.incident_id == incident_id
-        )
-        return db.execute(stmt).scalars().first()
-
-    @staticmethod
-    def create(
-        db: Session,
-        *,
-        incident_id: str,
-        resolver_team: str,
-        recommended_resolution: str,
-        resolution_source: str,
-    ) -> ResolutionIntelligence:
-        record = ResolutionIntelligence(
-            incident_id=incident_id,
-            resolver_team=resolver_team,
-            recommended_resolution=recommended_resolution,
-            resolution_source=resolution_source,
-            resolution_status="pending",
-        )
-        db.add(record)
-        db.flush()
-        return record
 
 
 class WarRoomRepository:
@@ -453,16 +283,18 @@ class IncidentPerformanceMetricRepository:
         return record
 
 
-class AgentExecutionRepository:
-    """Persistence operations for agent execution records."""
+class AgentExecutionLogRepository:
+    """Persistence operations for agent execution logs."""
 
     @staticmethod
-    def get_first_for_incident(
+    def get_for_incident_and_agent(
         db: Session,
         incident_id: str,
-    ) -> AgentExecution | None:
-        stmt = select(AgentExecution).where(
-            AgentExecution.incident_id == incident_id
+        agent_id: str,
+    ) -> AgentExecutionLog | None:
+        stmt = select(AgentExecutionLog).where(
+            AgentExecutionLog.incident_id == incident_id,
+            AgentExecutionLog.agent_id == agent_id,
         )
         return db.execute(stmt).scalars().first()
 
@@ -471,51 +303,28 @@ class AgentExecutionRepository:
         db: Session,
         *,
         incident_id: str,
-        agent_name: str,
-        model_name: str,
-        model_type: str,
-    ) -> AgentExecution:
-        record = AgentExecution(
+        agent_id: str,
+    ) -> AgentExecutionLog:
+        record = AgentExecutionLog(
             incident_id=incident_id,
-            agent_name=agent_name,
-            model_name=model_name,
-            model_type=model_type,
-            execution_status="completed",
+            agent_id=agent_id,
+            execution_history=[],
         )
         db.add(record)
         db.flush()
         return record
 
-
-class ModelFallbackRepository:
-    """Persistence operations for model fallback attempts."""
-
     @staticmethod
-    def get_first_for_execution(
-        db: Session,
-        execution_id: str,
-    ) -> ModelFallback | None:
-        stmt = select(ModelFallback).where(
-            ModelFallback.execution_id == execution_id
-        )
-        return db.execute(stmt).scalars().first()
-
-    @staticmethod
-    def create(
+    def append_execution_record(
         db: Session,
         *,
-        execution_id: str,
-        model_name: str,
-        fallback_level: str,
-        success: bool,
-    ) -> ModelFallback:
-        record = ModelFallback(
-            execution_id=execution_id,
-            model_name=model_name,
-            fallback_level=fallback_level,
-            success=success,
-        )
-        db.add(record)
+        record: AgentExecutionLog,
+        execution_record: AgentExecutionRecord,
+    ) -> AgentExecutionLog:
+        history = list(record.execution_history or [])
+        history.append(execution_record.model_dump(mode="json"))
+        record.execution_history = history
+        record.updated_at = datetime.now(timezone.utc)
         db.flush()
         return record
 

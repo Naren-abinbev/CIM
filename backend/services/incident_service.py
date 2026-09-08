@@ -20,6 +20,7 @@ def create_incident(
     *,
     payload: IncidentCreate,
     user_email: str,
+    user_id: str,
 ) -> IncidentMaster:
     """Validate business rules and create an incident record."""
     existing = IncidentRepository.get_by_number(
@@ -34,8 +35,10 @@ def create_incident(
     return IncidentRepository.create(
         db,
         incident_number=payload.incident_number,
+        user_id=user_id,
         user_email=user_email,
         subject=payload.subject,
+        category=payload.category,
         short_description=payload.short_description,
         description=payload.description,
         zone=payload.zone,
