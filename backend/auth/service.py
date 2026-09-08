@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from backend.auth import security
 from backend.database.models import User
 from backend.database.repositories import (
-    RefreshTokenRepository,
     UserRepository,
 )
 
@@ -112,7 +111,7 @@ def issue_token_pair(
     """
     Issue a new access token and refresh token for a user.
 
-    Creates a new refresh-token session record.
+    Refresh tokens are stateless JWTs and are not persisted in the database.
     """
     token_family = security.new_token_family()
 
@@ -120,21 +119,11 @@ def issue_token_pair(
         user_id=user.id,
     )
 
-    raw_refresh, refresh_hash, expires_at = (
+    raw_refresh, _, _ = (
         security.create_refresh_token(
             user_id=user.id,
             token_family=token_family,
         )
-    )
-
-    RefreshTokenRepository.create(
-        db,
-        user_id=user.id,
-        token_hash=refresh_hash,
-        token_family=token_family,
-        expires_at=expires_at,
-        user_agent=user_agent,
-        ip_address=ip_address,
     )
 
     return {
@@ -155,14 +144,8 @@ def refresh_token_pair(
     """
     Rotate a refresh token and issue a new token pair.
 
-    Steps:
-    1. Decode and validate the refresh JWT.
-    2. Look up the server-side session record by hash.
-    3. Reject if the record is missing, expired, or revoked.
-    4. Detect reuse: if the record is already revoked, revoke
-       the entire token family and reject.
-    5. Revoke the old record.
-    6. Issue a new token pair in the same family.
+    Decode the refresh JWT, verify that its user is active, and issue a new
+    pair. No refresh-token database record is required.
     """
     try:
         payload = security.decode_token(
@@ -182,61 +165,17 @@ def refresh_token_pair(
             "Invalid refresh token."
         )
 
-    token_hash = security.hash_refresh_token(raw_refresh_token)
-
-    record = RefreshTokenRepository.get_by_hash(db, token_hash)
-
-    if record is None:
-        raise InvalidRefreshTokenError(
-            "Invalid refresh token."
-        )
-
-    # Reuse detection: a revoked token being presented again
-    # indicates possible theft/replay. Revoke the whole family.
-    if record.revoked_at is not None:
-        RefreshTokenRepository.revoke_family(
-            db,
-            record.token_family,
-        )
-        raise RefreshTokenReuseError(
-            "Refresh token reuse detected. "
-            "Please sign in again."
-        )
-
-    if _is_expired(record.expires_at):
-        raise InvalidRefreshTokenError(
-            "Refresh token has expired."
-        )
-
-    user = UserRepository.get_by_id(db, record.user_id)
+    user = UserRepository.get_by_id(db, user_id)
 
     if user is None or not user.is_active:
         raise UserInactiveError("Account is disabled.")
 
-    # Revoke the old token, linking to its replacement.
-    new_refresh, new_refresh_hash, new_expires = (
+    new_refresh, _, _ = (
         security.create_refresh_token(
             user_id=user.id,
-            token_family=record.token_family,
+            token_family=token_family,
         )
     )
-
-    new_record = RefreshTokenRepository.create(
-        db,
-        user_id=user.id,
-        token_hash=new_refresh_hash,
-        token_family=record.token_family,
-        expires_at=new_expires,
-        user_agent=user_agent,
-        ip_address=ip_address,
-    )
-
-    RefreshTokenRepository.revoke(
-        db,
-        record,
-        replaced_by_token_id=new_record.id,
-    )
-    RefreshTokenRepository.touch_last_used(db, record)
 
     access_token, expires_in = security.create_access_token(
         user_id=user.id,
@@ -258,12 +197,7 @@ def revoke_refresh_token(
     """
     Revoke a refresh-token session (logout).
 
-    The raw token is hashed and matched against the
-    server-side record. If found, it is revoked.
+    Stateless refresh tokens cannot be revoked server-side without a
+    persistence or denylist mechanism. The client should discard its token.
     """
-    token_hash = security.hash_refresh_token(raw_refresh_token)
-
-    record = RefreshTokenRepository.get_by_hash(db, token_hash)
-
-    if record is not None and record.revoked_at is None:
-        RefreshTokenRepository.revoke(db, record)
+    return None

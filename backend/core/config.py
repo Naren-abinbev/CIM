@@ -72,6 +72,12 @@ class Settings:
         "data/sqlite/cim.db",
     )
 
+    # Agent identifiers
+    # Agent IDs are deployment configuration, not application code.
+    agent_id_sample_investigation_agent: str = _env(
+        "AGENT_ID_SAMPLE_INVESTIGATION_AGENT"
+    )
+
     # Gemini embeddings
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_embedding_model: str = os.getenv(
